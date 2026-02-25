@@ -5,6 +5,9 @@ mod scan;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use rayon::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "image-organiser")]
@@ -49,8 +52,301 @@ fn date_source_string(source: &metadata::DateSource) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ManifestEntry {
+    dir: PathBuf,
+    filename: String,
+    entry: manifest::FileEntry,
+}
+
+#[derive(Debug)]
+enum FileProcessingResult {
+    Imported {
+        dest: PathBuf,
+        manifest_entry: Option<ManifestEntry>,
+    },
+    Duplicate {
+        dest: Option<PathBuf>,
+        manifest_entry: Option<ManifestEntry>,
+    },
+    Undated {
+        dest: PathBuf,
+        manifest_entry: Option<ManifestEntry>,
+    },
+    Corrupt {
+        quarantine_dest: Option<PathBuf>,
+    },
+}
+
 fn now_iso8601() -> String {
     jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn create_manifest_entry(
+    dest: &PathBuf,
+    hex_hash: &str,
+    source_path: &PathBuf,
+    original_name: &str,
+    date_source: Option<&str>,
+    source_group: Option<&str>,
+) -> ManifestEntry {
+    let file_size = source_path
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let filename = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = dest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+
+    ManifestEntry {
+        dir,
+        filename,
+        entry: manifest::FileEntry {
+            sha256: hex_hash.to_string(),
+            original_path: source_path.to_string_lossy().into_owned(),
+            original_name: original_name.to_string(),
+            date_source: date_source.map(|s| s.to_string()),
+            source_group: source_group.map(|s| s.to_string()),
+            imported_at: now_iso8601(),
+            file_size_bytes: file_size,
+        },
+    }
+}
+
+fn process_file_for_copy(
+    path: &PathBuf,
+    extension: &str,
+    dedup_index: &std::collections::HashMap<String, PathBuf>,
+    target: &PathBuf,
+    execute: bool,
+    move_files: bool,
+    dry_run_prefix: &str,
+    op_word: &str,
+) -> FileProcessingResult {
+    // Extract source_group from filename
+    let source_group = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(scan::extract_source_group);
+
+    // Step 1: Hash file
+    let hash = match metadata::hash_file(path) {
+        Ok(h) => h,
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "WARNING: Source file disappeared: {}",
+                    path.display()
+                );
+            } else {
+                eprintln!("CORRUPT: {} ({})", path.display(), err);
+                if execute {
+                    let corrupt_dir = target.join("corrupt");
+                    let original_name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    if let Err(e) = copy_to_dir(path, &corrupt_dir, &original_name) {
+                        eprintln!(
+                            "WARNING: Failed to quarantine {}: {}",
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+            return FileProcessingResult::Corrupt {
+                quarantine_dest: None,
+            };
+        }
+    };
+
+    let hex_hash = format_hash(&hash);
+
+    // Step 2: Check for duplicates
+    if let Some(existing) = dedup_index.get(&hex_hash) {
+        if execute {
+            let dup_dir = target.join("duplicates");
+            let original_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".to_string());
+            match copy_to_dir(path, &dup_dir, &original_name) {
+                Ok(dest) => {
+                    eprintln!(
+                        "DUPLICATE {} -> {} (same as {})",
+                        path.display(),
+                        dest.display(),
+                        existing.display()
+                    );
+                    let manifest_entry = create_manifest_entry(&dest, &hex_hash, path, &original_name, None, source_group.as_deref());
+                    if move_files {
+                        remove_source_safely(path, &dest);
+                    }
+                    return FileProcessingResult::Duplicate {
+                        dest: Some(dest),
+                        manifest_entry: Some(manifest_entry),
+                    };
+                }
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!(
+                            "WARNING: Failed to copy duplicate {}: {}",
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        } else {
+            eprintln!(
+                "{}DUPLICATE {} (same as {})",
+                dry_run_prefix,
+                path.display(),
+                existing.display()
+            );
+        }
+        return FileProcessingResult::Duplicate {
+            dest: None,
+            manifest_entry: None,
+        };
+    }
+
+    // Step 3: Extract date
+    let date = metadata::extract_date(path);
+
+    match &date {
+        metadata::DateExtracted::Found { year, month, source, .. } => {
+            let dest_dir = target.join(format!("{:04}", year)).join(format!("{:02}", month));
+            let filename = manifest::generate_filename(&date, extension, &hash, &dest_dir);
+            let dest = dest_dir.join(&filename);
+
+            if execute {
+                match copy_file_to(path, &dest) {
+                    Ok(()) => {
+                        eprintln!(
+                            "{} {} -> {}",
+                            op_word,
+                            path.display(),
+                            dest.display()
+                        );
+                        let original_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let manifest_entry = create_manifest_entry(
+                            &dest,
+                            &hex_hash,
+                            path,
+                            &original_name,
+                            Some(date_source_string(source)),
+                            source_group.as_deref(),
+                        );
+                        if move_files {
+                            remove_source_safely(path, &dest);
+                        }
+                        FileProcessingResult::Imported {
+                            dest,
+                            manifest_entry: Some(manifest_entry),
+                        }
+                    }
+                    Err(e) => {
+                        if is_disk_full(&e) {
+                            std::fs::remove_file(&dest).ok();
+                            eprintln!("ERROR: Target disk full");
+                        }
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            eprintln!(
+                                "CORRUPT: {} (copy failed: {})",
+                                path.display(),
+                                e
+                            );
+                        }
+                        FileProcessingResult::Corrupt {
+                            quarantine_dest: None,
+                        }
+                    }
+                }
+            } else {
+                eprintln!(
+                    "{}{} {} -> {}",
+                    dry_run_prefix,
+                    op_word,
+                    path.display(),
+                    dest.display()
+                );
+                FileProcessingResult::Imported {
+                    dest,
+                    manifest_entry: None,
+                }
+            }
+        }
+        metadata::DateExtracted::NotFound => {
+            let dest_dir = target.join("undated");
+            let original_stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let hash_suffix = format!("{:02x}{:02x}", hash[0], hash[1]);
+            let filename = format!("{}_{}.{}", original_stem, hash_suffix, extension);
+            let dest = dest_dir.join(&filename);
+
+            if execute {
+                match copy_file_to(path, &dest) {
+                    Ok(()) => {
+                        eprintln!(
+                            "{} {} -> {}",
+                            op_word,
+                            path.display(),
+                            dest.display()
+                        );
+                        let original_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let manifest_entry =
+                            create_manifest_entry(&dest, &hex_hash, path, &original_name, None, source_group.as_deref());
+                        if move_files {
+                            remove_source_safely(path, &dest);
+                        }
+                        FileProcessingResult::Undated {
+                            dest,
+                            manifest_entry: Some(manifest_entry),
+                        }
+                    }
+                    Err(e) => {
+                        if is_disk_full(&e) {
+                            std::fs::remove_file(&dest).ok();
+                            eprintln!("ERROR: Target disk full");
+                        }
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            eprintln!(
+                                "CORRUPT: {} (copy failed: {})",
+                                path.display(),
+                                e
+                            );
+                        }
+                        FileProcessingResult::Corrupt {
+                            quarantine_dest: None,
+                        }
+                    }
+                }
+            } else {
+                eprintln!(
+                    "{}UNDATED {} -> {}",
+                    dry_run_prefix,
+                    path.display(),
+                    dest.display()
+                );
+                FileProcessingResult::Undated {
+                    dest,
+                    manifest_entry: None,
+                }
+            }
+        }
+    }
 }
 
 fn main() {
@@ -84,7 +380,7 @@ fn main() {
                 }
             }
 
-            let progress = ProgressBar::new(recognized.len() as u64);
+            let progress = Arc::new(ProgressBar::new(recognized.len() as u64));
             progress
                 .set_style(
                     ProgressStyle::default_bar()
@@ -92,274 +388,92 @@ fn main() {
                         .unwrap_or_else(|_| ProgressStyle::default_bar()), // safe: static template string
                 );
 
-            let mut imported_count: usize = 0;
-            let mut duplicate_count: usize = 0;
-            let mut corrupt_count: usize = 0;
-            let mut undated_count: usize = 0;
-
             let dry_run_prefix = if execute { "" } else { "[DRY RUN] " };
             let op_word = if move_files { "MOVE" } else { "COPY" };
 
-            for (path, extension) in &recognized {
-                let hash = match metadata::hash_file(path) {
-                    Ok(h) => h,
-                    Err(err) => {
-                        if err.kind() == std::io::ErrorKind::NotFound {
-                            eprintln!(
-                                "WARNING: Source file disappeared: {}",
-                                path.display()
-                            );
-                        } else {
-                            eprintln!("CORRUPT: {} ({})", path.display(), err);
-                            if execute {
-                                let corrupt_dir = target.join("corrupt");
-                                let original_name = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| "unknown".to_string());
-                                if let Err(e) = copy_to_dir(path, &corrupt_dir, &original_name) {
-                                    eprintln!(
-                                        "WARNING: Failed to quarantine {}: {}",
-                                        path.display(),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        corrupt_count += 1;
-                        progress.inc(1);
-                        continue;
-                    }
-                };
+            // Atomic counters for results
+            let imported_count = Arc::new(AtomicUsize::new(0));
+            let duplicate_count = Arc::new(AtomicUsize::new(0));
+            let corrupt_count = Arc::new(AtomicUsize::new(0));
+            let undated_count = Arc::new(AtomicUsize::new(0));
 
-                let hex_hash = format_hash(&hash);
-                let source_group = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(scan::extract_source_group);
+            // Parallel processing
+            let results: Vec<_> = recognized
+                .par_iter()
+                .map(|(path, extension)| {
+                    let result = process_file_for_copy(
+                        path,
+                        extension,
+                        &dedup_index,
+                        &target,
+                        execute,
+                        move_files,
+                        dry_run_prefix,
+                        op_word,
+                    );
 
-                if let Some(existing) = dedup_index.get(&hex_hash) {
-                    if execute {
-                        let dup_dir = target.join("duplicates");
-                        let original_name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "unknown".to_string());
-                        match copy_to_dir(path, &dup_dir, &original_name) {
-                            Ok(dest) => {
-                                eprintln!(
-                                    "DUPLICATE {} -> {} (same as {})",
-                                    path.display(),
-                                    dest.display(),
-                                    existing.display()
-                                );
-                                update_manifest_for_file(
-                                    &dup_dir, &dest, &hex_hash, path, &original_name,
-                                    None, source_group.as_deref(), extension,
-                                );
-                                if move_files {
-                                    remove_source_safely(path, &dest);
-                                }
-                            }
-                            Err(e) => {
-                                if e.kind() == std::io::ErrorKind::NotFound {
-                                    eprintln!(
-                                        "WARNING: Source file disappeared: {}",
-                                        path.display()
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "WARNING: Failed to copy duplicate {}: {}",
-                                        path.display(),
-                                        e
-                                    );
-                                }
-                            }
+                    // Update counters
+                    match &result {
+                        FileProcessingResult::Imported { .. } => {
+                            imported_count.fetch_add(1, Ordering::Relaxed);
                         }
-                    } else {
-                        eprintln!(
-                            "{}DUPLICATE {} (same as {})",
-                            dry_run_prefix,
-                            path.display(),
-                            existing.display()
-                        );
+                        FileProcessingResult::Duplicate { .. } => {
+                            duplicate_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        FileProcessingResult::Undated { .. } => {
+                            undated_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        FileProcessingResult::Corrupt { .. } => {
+                            corrupt_count.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                    duplicate_count += 1;
+
+                    // Thread-safe progress update
                     progress.inc(1);
-                    continue;
-                }
 
-                let date = metadata::extract_date(path);
-
-                match &date {
-                    metadata::DateExtracted::Found { year, month, source, .. } => {
-                        let dest_dir =
-                            target.join(format!("{:04}", year)).join(format!("{:02}", month));
-                        let filename =
-                            manifest::generate_filename(&date, extension, &hash, &dest_dir);
-                        let dest = dest_dir.join(&filename);
-
-                        if execute {
-                            match copy_file_to(path, &dest) {
-                                Ok(()) => {
-                                    eprintln!(
-                                        "{} {} -> {}",
-                                        op_word,
-                                        path.display(),
-                                        dest.display()
-                                    );
-                                    let original_name = path
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    update_manifest_for_file(
-                                        &dest_dir,
-                                        &dest,
-                                        &hex_hash,
-                                        path,
-                                        &original_name,
-                                        Some(&date_source_string(source)),
-                                        source_group.as_deref(),
-                                        extension,
-                                    );
-                                    if move_files {
-                                        remove_source_safely(path, &dest);
-                                    }
-                                }
-                                Err(e) => {
-                                    if is_disk_full(&e) {
-                                        std::fs::remove_file(&dest).ok();
-                                        progress.finish_and_clear();
-                                        eprintln!(
-                                            "ERROR: Target disk full. Import aborted after {} files.",
-                                            imported_count
-                                        );
-                                        print_summary(
-                                            imported_count,
-                                            duplicate_count,
-                                            corrupt_count,
-                                            undated_count,
-                                            skipped_count,
-                                            execute,
-                                        );
-                                        return;
-                                    }
-                                    if e.kind() == std::io::ErrorKind::NotFound {
-                                        eprintln!(
-                                            "WARNING: Source file disappeared: {}",
-                                            path.display()
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "CORRUPT: {} (copy failed: {})",
-                                            path.display(),
-                                            e
-                                        );
-                                    }
-                                    corrupt_count += 1;
-                                    progress.inc(1);
-                                    continue;
-                                }
-                            }
-                        } else {
-                            eprintln!(
-                                "{}{} {} -> {}",
-                                dry_run_prefix,
-                                op_word,
-                                path.display(),
-                                dest.display()
-                            );
-                        }
-                        imported_count += 1;
-                    }
-                    metadata::DateExtracted::NotFound => {
-                        let dest_dir = target.join("undated");
-                        let original_stem = path
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let hash_suffix = format!("{:02x}{:02x}", hash[0], hash[1]);
-                        let filename =
-                            format!("{}_{}.{}", original_stem, hash_suffix, extension);
-                        let dest = dest_dir.join(&filename);
-
-                        if execute {
-                            match copy_file_to(path, &dest) {
-                                Ok(()) => {
-                                    eprintln!(
-                                        "{} {} -> {}",
-                                        op_word,
-                                        path.display(),
-                                        dest.display()
-                                    );
-                                    let original_name = path
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    update_manifest_for_file(
-                                        &dest_dir,
-                                        &dest,
-                                        &hex_hash,
-                                        path,
-                                        &original_name,
-                                        None,
-                                        source_group.as_deref(),
-                                        extension,
-                                    );
-                                    if move_files {
-                                        remove_source_safely(path, &dest);
-                                    }
-                                }
-                                Err(e) => {
-                                    if is_disk_full(&e) {
-                                        std::fs::remove_file(&dest).ok();
-                                        progress.finish_and_clear();
-                                        eprintln!(
-                                            "ERROR: Target disk full. Import aborted after {} files.",
-                                            imported_count
-                                        );
-                                        print_summary(
-                                            imported_count,
-                                            duplicate_count,
-                                            corrupt_count,
-                                            undated_count,
-                                            skipped_count,
-                                            execute,
-                                        );
-                                        return;
-                                    }
-                                    if e.kind() == std::io::ErrorKind::NotFound {
-                                        eprintln!(
-                                            "WARNING: Source file disappeared: {}",
-                                            path.display()
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "CORRUPT: {} (copy failed: {})",
-                                            path.display(),
-                                            e
-                                        );
-                                    }
-                                    corrupt_count += 1;
-                                    progress.inc(1);
-                                    continue;
-                                }
-                            }
-                        } else {
-                            eprintln!(
-                                "{}UNDATED {} -> {}",
-                                dry_run_prefix,
-                                path.display(),
-                                dest.display()
-                            );
-                        }
-                        undated_count += 1;
-                    }
-                }
-                progress.inc(1);
-            }
+                    result
+                })
+                .collect();
 
             progress.finish_and_clear();
+
+            // Batch manifest updates
+            if execute {
+                let mut manifest_batches: std::collections::HashMap<PathBuf, Vec<(String, manifest::FileEntry)>> =
+                    std::collections::HashMap::new();
+
+                for result in &results {
+                    match result {
+                        FileProcessingResult::Imported { manifest_entry, .. }
+                        | FileProcessingResult::Duplicate { manifest_entry, .. }
+                        | FileProcessingResult::Undated { manifest_entry, .. } => {
+                            if let Some(entry) = manifest_entry {
+                                manifest_batches
+                                    .entry(entry.dir.clone())
+                                    .or_insert_with(Vec::new)
+                                    .push((entry.filename.clone(), entry.entry.clone()));
+                            }
+                        }
+                        FileProcessingResult::Corrupt { .. } => {}
+                    }
+                }
+
+                // Write all manifests
+                for (dir, entries) in manifest_batches {
+                    let mut m = manifest::load_manifest(&dir);
+                    for (filename, file_entry) in entries {
+                        m.files.insert(filename, file_entry);
+                    }
+                    if let Err(e) = manifest::save_manifest(&dir, &m) {
+                        eprintln!("WARNING: Failed to save manifest in {}: {}", dir.display(), e);
+                    }
+                }
+            }
+
+            let imported_count = imported_count.load(Ordering::SeqCst);
+            let duplicate_count = duplicate_count.load(Ordering::SeqCst);
+            let corrupt_count = corrupt_count.load(Ordering::SeqCst);
+            let undated_count = undated_count.load(Ordering::SeqCst);
             print_summary(
                 imported_count,
                 duplicate_count,

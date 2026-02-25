@@ -10,7 +10,7 @@ pub struct Manifest {
     pub files: HashMap<String, FileEntry>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FileEntry {
     pub sha256: String,
     pub original_path: String,
