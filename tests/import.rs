@@ -75,24 +75,39 @@ fn execute_creates_organized_structure_with_manifests() {
         .args(["import", source.path().to_str().unwrap(), target.path().to_str().unwrap(), "--execute"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("undated"));
+        .stdout(predicate::str::contains("2 imported"));
 
-    let undated_dir = target.path().join("undated");
-    assert!(undated_dir.exists(), "undated/ directory must be created");
+    // Files should be in dated folders (using filesystem dates)
+    let mut manifest_found = false;
+    for entry in fs::read_dir(target.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            let year_dir = entry.path();
+            if year_dir.file_name().unwrap().to_str().unwrap().chars().all(|c| c.is_numeric()) {
+                for month_entry in fs::read_dir(&year_dir).unwrap() {
+                    let month_dir = month_entry.unwrap().path();
+                    if month_dir.is_dir() {
+                        let manifest = read_manifest(&month_dir);
+                        assert_eq!(manifest["version"], 1);
 
-    let manifest = read_manifest(&undated_dir);
-    assert_eq!(manifest["version"], 1);
-
-    let files = manifest["files"].as_object().expect("files is object");
-    assert_eq!(files.len(), 2, "both files should be in manifest");
-
-    for (_filename, entry) in files {
-        assert!(entry["sha256"].is_string(), "sha256 must be present");
-        assert!(entry["original_path"].is_string(), "original_path must be present");
-        assert!(entry["original_name"].is_string(), "original_name must be present");
-        assert!(entry["imported_at"].is_string(), "imported_at must be present");
-        assert!(entry["file_size_bytes"].is_number(), "file_size_bytes must be present");
+                        if let Some(files) = manifest["files"].as_object() {
+                            if !files.is_empty() {
+                                manifest_found = true;
+                                for (_filename, entry) in files {
+                                    assert!(entry["sha256"].is_string(), "sha256 must be present");
+                                    assert!(entry["original_path"].is_string(), "original_path must be present");
+                                    assert!(entry["original_name"].is_string(), "original_name must be present");
+                                    assert!(entry["imported_at"].is_string(), "imported_at must be present");
+                                    assert!(entry["file_size_bytes"].is_number(), "file_size_bytes must be present");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+    assert!(manifest_found, "manifest with files should be created in dated folder");
 }
 
 // --- S2: Deduplication Across Multiple Imports ---
@@ -118,7 +133,7 @@ fn second_import_detects_duplicates() {
         .args(["import", second_source.path().to_str().unwrap(), target.path().to_str().unwrap(), "--execute"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("1 undated"))
+        .stdout(predicate::str::contains("1 imported"))
         .stdout(predicate::str::contains("1 duplicates"));
 
     let dup_dir = target.path().join("duplicates");
@@ -142,7 +157,7 @@ fn idempotent_rerun_shows_all_duplicates() {
         .args(["import", source.path().to_str().unwrap(), target.path().to_str().unwrap(), "--execute"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("3 undated"));
+        .stdout(predicate::str::contains("3 imported"));
 
     cmd()
         .args(["import", source.path().to_str().unwrap(), target.path().to_str().unwrap()])
@@ -167,16 +182,48 @@ fn collision_resolution_preserves_all_files() {
         .assert()
         .success();
 
-    let undated_dir = target.path().join("undated");
-    let manifest = read_manifest(&undated_dir);
-    let files = manifest["files"].as_object().expect("files is object");
-    assert_eq!(files.len(), 3, "all 3 burst files must be preserved");
+    // Collect all files from all directories (dated folders, duplicates, undated, corrupt)
+    let mut total_files = 0;
+    let mut all_hashes = std::collections::HashSet::new();
 
-    let hashes: std::collections::HashSet<_> = files
-        .values()
-        .map(|e| e["sha256"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(hashes.len(), 3, "all 3 files must have distinct hashes");
+    fn collect_from_dir(dir: &std::path::Path, total_files: &mut usize, all_hashes: &mut std::collections::HashSet<String>) {
+        if dir.exists() && dir.is_dir() {
+            if dir.join(".manifest.json").exists() {
+                let manifest = read_manifest(dir);
+                if let Some(files) = manifest["files"].as_object() {
+                    *total_files += files.len();
+                    for (_filename, entry) in files {
+                        all_hashes.insert(entry["sha256"].as_str().unwrap().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Check dated folders
+    for entry in fs::read_dir(target.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            let dir_path = entry.path();
+            let dir_name = dir_path.file_name().unwrap().to_str().unwrap();
+
+            // Check if it's a year directory (4 digits)
+            if dir_name.len() == 4 && dir_name.chars().all(|c| c.is_numeric()) {
+                for month_entry in fs::read_dir(&dir_path).unwrap() {
+                    let month_dir = month_entry.unwrap().path();
+                    if month_dir.is_dir() {
+                        collect_from_dir(&month_dir, &mut total_files, &mut all_hashes);
+                    }
+                }
+            } else {
+                // Check special directories (duplicates, undated, corrupt)
+                collect_from_dir(&dir_path, &mut total_files, &mut all_hashes);
+            }
+        }
+    }
+
+    assert_eq!(total_files, 3, "all 3 burst files must be preserved (found {} files)", total_files);
+    assert_eq!(all_hashes.len(), 3, "all 3 files must have distinct hashes");
 }
 
 // --- S6: Move vs Copy Semantics ---
@@ -222,16 +269,32 @@ fn move_removes_source_files() {
         "source file must be removed after move"
     );
 
-    let undated_dir = target.path().join("undated");
-    let manifest = read_manifest(&undated_dir);
-    let files = manifest["files"].as_object().expect("files is object");
-    assert_eq!(files.len(), 1, "file must be in target");
+    // File should be in dated folder (using filesystem date)
+    let mut total_files = 0;
+    for entry in fs::read_dir(target.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            let year_dir = entry.path();
+            if year_dir.file_name().unwrap().to_str().unwrap().chars().all(|c| c.is_numeric()) {
+                for month_entry in fs::read_dir(&year_dir).unwrap() {
+                    let month_dir = month_entry.unwrap().path();
+                    if month_dir.is_dir() {
+                        let manifest = read_manifest(&month_dir);
+                        if let Some(files) = manifest["files"].as_object() {
+                            total_files += files.len();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(total_files, 1, "file must be in target");
 }
 
 // --- S7: Undated File Handling ---
 
 #[test]
-fn files_without_metadata_go_to_undated() {
+fn files_without_metadata_use_filesystem_dates() {
     let source = TempDir::new().unwrap();
     let target = TempDir::new().unwrap();
 
@@ -241,20 +304,38 @@ fn files_without_metadata_go_to_undated() {
         .args(["import", source.path().to_str().unwrap(), target.path().to_str().unwrap(), "--execute"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("1 undated"));
+        .stdout(predicate::str::contains("1 imported").or(predicate::str::contains("0 undated")));
 
-    let undated_dir = target.path().join("undated");
-    assert!(undated_dir.exists());
-
-    let manifest = read_manifest(&undated_dir);
-    let files = manifest["files"].as_object().expect("files is object");
-    let entry = files.values().next().expect("at least one entry");
-    assert!(entry.get("date_source").is_none() || entry["date_source"].is_null(),
-        "undated files must not have a date_source");
+    // File should be in a dated folder (using filesystem date), not undated/
+    let mut found_file = false;
+    for entry in fs::read_dir(target.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            let year_dir = entry.path();
+            if year_dir.file_name().unwrap().to_str().unwrap().chars().all(|c| c.is_numeric()) {
+                for month_entry in fs::read_dir(&year_dir).unwrap() {
+                    let month_dir = month_entry.unwrap().path();
+                    if month_dir.is_dir() {
+                        let manifest = read_manifest(&month_dir);
+                        if let Some(files) = manifest["files"].as_object() {
+                            for (_filename, entry) in files {
+                                if let Some(date_source) = entry.get("date_source") {
+                                    if date_source == "filesystem_created" || date_source == "filesystem_modified" {
+                                        found_file = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(found_file, "file without metadata should use filesystem date and be in dated folder");
 }
 
 #[test]
-fn undated_filename_includes_hash_suffix() {
+fn filesystem_dates_preferred_over_undated() {
     let source = TempDir::new().unwrap();
     let target = TempDir::new().unwrap();
 
@@ -265,15 +346,22 @@ fn undated_filename_includes_hash_suffix() {
         .assert()
         .success();
 
-    let undated_dir = target.path().join("undated");
-    let manifest = read_manifest(&undated_dir);
-    let filenames: Vec<_> = manifest["files"].as_object().unwrap().keys().collect();
-    assert_eq!(filenames.len(), 1);
-
-    let filename = filenames[0];
-    assert!(filename.starts_with("IMG_1234_"), "undated file should preserve original stem");
-    assert!(filename.ends_with(".png"), "undated file should preserve extension");
-    assert!(filename.len() > "IMG_1234_.png".len(), "undated file should have hash suffix");
+    // File should use filesystem date and NOT go to undated/
+    // It should be in a YYYY/MM/ folder with timestamp-based filename
+    let mut found_in_dated = false;
+    for entry in fs::read_dir(target.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap();
+            // Check if it's a year directory (4 digits)
+            if name_str.len() == 4 && name_str.chars().all(|c| c.is_numeric()) {
+                found_in_dated = true;
+                break;
+            }
+        }
+    }
+    assert!(found_in_dated, "file should be in dated folder (YYYY/MM/), not undated/");
 }
 
 // --- S8: Unrecognized File Types ---
@@ -313,16 +401,33 @@ fn source_group_tracked_in_manifest() {
         .assert()
         .success();
 
-    let undated_dir = target.path().join("undated");
-    let manifest = read_manifest(&undated_dir);
-    let files = manifest["files"].as_object().expect("files is object");
+    // Files should be in dated folders (using filesystem dates)
+    let mut source_groups = vec![];
+    for entry in fs::read_dir(target.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            let year_dir = entry.path();
+            if year_dir.file_name().unwrap().to_str().unwrap().chars().all(|c| c.is_numeric()) {
+                for month_entry in fs::read_dir(&year_dir).unwrap() {
+                    let month_dir = month_entry.unwrap().path();
+                    if month_dir.is_dir() {
+                        let manifest = read_manifest(&month_dir);
+                        if let Some(files) = manifest["files"].as_object() {
+                            for (_filename, entry) in files {
+                                if let Some(sg) = entry.get("source_group") {
+                                    source_groups.push(sg.as_str().unwrap().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-    for (_filename, entry) in files {
-        assert_eq!(
-            entry["source_group"].as_str().unwrap(),
-            "IMG_1234",
-            "all related files must share source_group"
-        );
+    assert_eq!(source_groups.len(), 3, "should have 3 files with source_group");
+    for sg in source_groups {
+        assert_eq!(sg, "IMG_1234", "all related files must share source_group");
     }
 }
 
@@ -355,9 +460,24 @@ fn manifest_version_is_always_1() {
         .assert()
         .success();
 
-    let undated_dir = target.path().join("undated");
-    let manifest = read_manifest(&undated_dir);
-    assert_eq!(manifest["version"], 1);
+    // Find the manifest in dated folder
+    for entry in fs::read_dir(target.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            let year_dir = entry.path();
+            if year_dir.file_name().unwrap().to_str().unwrap().chars().all(|c| c.is_numeric()) {
+                for month_entry in fs::read_dir(&year_dir).unwrap() {
+                    let month_dir = month_entry.unwrap().path();
+                    if month_dir.is_dir() {
+                        let manifest = read_manifest(&month_dir);
+                        assert_eq!(manifest["version"], 1);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    panic!("No manifest found in dated folders");
 }
 
 #[test]
@@ -372,13 +492,30 @@ fn manifest_imported_at_is_utc() {
         .assert()
         .success();
 
-    let undated_dir = target.path().join("undated");
-    let manifest = read_manifest(&undated_dir);
-    let files = manifest["files"].as_object().unwrap();
-    let entry = files.values().next().unwrap();
-    let imported_at = entry["imported_at"].as_str().unwrap();
-    assert!(imported_at.ends_with('Z'), "imported_at must end with Z (UTC)");
-    assert!(imported_at.contains('T'), "imported_at must be ISO 8601");
+    // Find the manifest in dated folder
+    for entry in fs::read_dir(target.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            let year_dir = entry.path();
+            if year_dir.file_name().unwrap().to_str().unwrap().chars().all(|c| c.is_numeric()) {
+                for month_entry in fs::read_dir(&year_dir).unwrap() {
+                    let month_dir = month_entry.unwrap().path();
+                    if month_dir.is_dir() {
+                        let manifest = read_manifest(&month_dir);
+                        if let Some(files) = manifest["files"].as_object() {
+                            if let Some(entry) = files.values().next() {
+                                let imported_at = entry["imported_at"].as_str().unwrap();
+                                assert!(imported_at.ends_with('Z'), "imported_at must end with Z (UTC)");
+                                assert!(imported_at.contains('T'), "imported_at must be ISO 8601");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    panic!("No manifest with files found in dated folders");
 }
 
 // --- Summary Format ---

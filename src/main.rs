@@ -49,6 +49,8 @@ fn date_source_string(source: &metadata::DateSource) -> &'static str {
         metadata::DateSource::ExifDateTime => "exif_datetime",
         metadata::DateSource::QuickTimeCreationDate => "quicktime_creation_date",
         metadata::DateSource::QuickTimeMediaCreateDate => "quicktime_media_create_date",
+        metadata::DateSource::FilesystemCreated => "filesystem_created",
+        metadata::DateSource::FilesystemModified => "filesystem_modified",
     }
 }
 
@@ -124,6 +126,7 @@ fn process_file_for_copy(
     move_files: bool,
     dry_run_prefix: &str,
     op_word: &str,
+    file_op_lock: &std::sync::Arc<std::sync::Mutex<()>>,
 ) -> FileProcessingResult {
     // Extract source_group from filename
     let source_group = path
@@ -220,10 +223,17 @@ fn process_file_for_copy(
     match &date {
         metadata::DateExtracted::Found { year, month, source, .. } => {
             let dest_dir = target.join(format!("{:04}", year)).join(format!("{:02}", month));
-            let filename = manifest::generate_filename(&date, extension, &hash, &dest_dir);
-            let dest = dest_dir.join(&filename);
+
+            // Lock to prevent race condition in filename generation + copy
+            let (filename, dest) = {
+                let _lock = file_op_lock.lock().unwrap();
+                let filename = manifest::generate_filename(&date, extension, &hash, &dest_dir);
+                let dest = dest_dir.join(&filename);
+                (filename, dest)
+            };
 
             if execute {
+                let _lock = file_op_lock.lock().unwrap();
                 match copy_file_to(path, &dest) {
                     Ok(()) => {
                         eprintln!(
@@ -294,6 +304,7 @@ fn process_file_for_copy(
             let dest = dest_dir.join(&filename);
 
             if execute {
+                let _lock = file_op_lock.lock().unwrap();
                 match copy_file_to(path, &dest) {
                     Ok(()) => {
                         eprintln!(
@@ -397,6 +408,10 @@ fn main() {
             let corrupt_count = Arc::new(AtomicUsize::new(0));
             let undated_count = Arc::new(AtomicUsize::new(0));
 
+            // Synchronize file operations to prevent race conditions in parallel mode
+            use std::sync::Mutex;
+            let file_op_lock = Arc::new(Mutex::new(()));
+
             // Parallel processing
             let results: Vec<_> = recognized
                 .par_iter()
@@ -410,6 +425,7 @@ fn main() {
                         move_files,
                         dry_run_prefix,
                         op_word,
+                        &file_op_lock,
                     );
 
                     // Update counters
@@ -584,41 +600,6 @@ fn remove_source_safely(
     }
 }
 
-fn update_manifest_for_file(
-    dest_dir: &std::path::Path,
-    dest: &std::path::Path,
-    hex_hash: &str,
-    source_path: &std::path::Path,
-    original_name: &str,
-    date_source: Option<&str>,
-    source_group: Option<&str>,
-    _extension: &str,
-) {
-    let mut m = manifest::load_manifest(dest_dir);
-    let filename = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let file_size = source_path
-        .metadata()
-        .map(|m| m.len())
-        .unwrap_or(0);
-    m.files.insert(
-        filename,
-        manifest::FileEntry {
-            sha256: hex_hash.to_string(),
-            original_path: source_path.to_string_lossy().into_owned(),
-            original_name: original_name.to_string(),
-            date_source: date_source.map(|s| s.to_string()),
-            source_group: source_group.map(|s| s.to_string()),
-            imported_at: now_iso8601(),
-            file_size_bytes: file_size,
-        },
-    );
-    if let Err(e) = manifest::save_manifest(dest_dir, &m) {
-        eprintln!("WARNING: Failed to save manifest in {}: {}", dest_dir.display(), e);
-    }
-}
 
 fn is_disk_full(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(28)

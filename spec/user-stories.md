@@ -145,22 +145,24 @@ And no data loss: SHA-256 hashes of target files match what was in source
 ## S7: Undated File Handling
 
 **As** a dump collector,
-**I want** files with no extractable date to be preserved in a dedicated folder,
-**so that** they're not lost but also don't pollute dated folders with wrong timestamps.
+**I want** files with no extractable metadata to fall back to filesystem timestamps before going to undated/,
+**so that** I minimize manual sorting while still prioritizing accurate embedded dates.
 
 **Acceptance criteria**:
 
 Given a source with:
 - 20 files with valid EXIF/QuickTime dates
-- 5 files with no metadata (e.g., screenshots, edited images)
+- 5 files with no metadata but valid filesystem creation dates (e.g., screenshots)
+- 2 files with neither metadata nor filesystem dates
 When I run import --execute
-Then 20 files land in dated folders (YYYY/MM/)
-And 5 files land in `undated/` folder
+Then 20 files land in dated folders (YYYY/MM/) based on EXIF/QuickTime dates
+And 5 files land in dated folders (YYYY/MM/) based on filesystem creation dates
+And their manifests show `date_source: "filesystem_created"` or `"filesystem_modified"`
+And 2 files with no dates land in `undated/` folder
 And undated files are renamed with source filename + hash suffix for uniqueness: `original_name_a1b2.ext`
 And `undated/.manifest.json` shows `date_source: null` for these files
-And I can browse undated/ to manually sort these files later
 
-**No guessing**: Filesystem timestamps (created/modified) are never used for dating—only metadata.
+**Fallback hierarchy**: EXIF/QuickTime metadata always preferred. Filesystem timestamps used only as last resort. This prevents 20% of files going to undated/ while maintaining data quality through manifest transparency.
 
 ---
 

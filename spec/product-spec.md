@@ -81,10 +81,14 @@ Priority order for date extraction:
 3. EXIF `DateTime`
 4. QuickTime `CreationDate` (for MOV/MP4)
 5. QuickTime `MediaCreateDate`
+6. Filesystem creation date (last resort fallback)
+7. Filesystem modification date (if creation date unavailable)
 
 Multiple date format strings attempted (the image-organizer's single-format approach is what caused the panic).
 
-If all metadata extraction fails: file goes to `undated/`.
+**Filesystem fallback rationale**: While filesystem timestamps are unreliable (change on copy/transfer), they're better than losing 20% of files to `undated/`. Embedded metadata always takes priority. Users can identify filesystem-dated files via the `date_source: "filesystem_created"` or `"filesystem_modified"` field in manifests.
+
+If all metadata extraction fails (including filesystem dates): file goes to `undated/`.
 
 ### Error Handling
 

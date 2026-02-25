@@ -24,6 +24,8 @@ pub enum DateSource {
     ExifDateTime,
     QuickTimeCreationDate,
     QuickTimeMediaCreateDate,
+    FilesystemCreated,
+    FilesystemModified,
 }
 
 pub fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
@@ -46,6 +48,9 @@ pub fn extract_date(path: &Path) -> DateExtracted {
         return result;
     }
     if let Some(result) = try_quicktime_dates(path) {
+        return result;
+    }
+    if let Some(result) = try_filesystem_dates(path) {
         return result;
     }
     DateExtracted::NotFound
@@ -91,6 +96,44 @@ fn try_quicktime_dates(path: &Path) -> Option<DateExtracted> {
         }
     }
     None
+}
+
+fn try_filesystem_dates(path: &Path) -> Option<DateExtracted> {
+    let metadata = std::fs::metadata(path).ok()?;
+
+    // Try creation time first (not available on all platforms/filesystems)
+    if let Ok(created) = metadata.created() {
+        if let Some(extracted) = system_time_to_date(created, DateSource::FilesystemCreated) {
+            return Some(extracted);
+        }
+    }
+
+    // Fall back to modification time
+    if let Ok(modified) = metadata.modified() {
+        if let Some(extracted) = system_time_to_date(modified, DateSource::FilesystemModified) {
+            return Some(extracted);
+        }
+    }
+
+    None
+}
+
+fn system_time_to_date(time: std::time::SystemTime, source: DateSource) -> Option<DateExtracted> {
+    use std::time::UNIX_EPOCH;
+
+    let duration = time.duration_since(UNIX_EPOCH).ok()?;
+    let timestamp = jiff::Timestamp::from_second(duration.as_secs() as i64).ok()?;
+    let dt = timestamp.to_zoned(jiff::tz::TimeZone::UTC).datetime();
+
+    Some(DateExtracted::Found {
+        year: dt.year() as u16,
+        month: dt.month() as u8,
+        day: dt.day() as u8,
+        hour: dt.hour() as u8,
+        minute: dt.minute() as u8,
+        second: dt.second() as u8,
+        source,
+    })
 }
 
 fn entry_value_to_date(entry: &nom_exif::EntryValue, source: DateSource) -> Option<DateExtracted> {
