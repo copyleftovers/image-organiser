@@ -31,6 +31,9 @@ enum Commands {
         /// Move files instead of copying (default: copy)
         #[arg(long, rename_all = "kebab-case")]
         r#move: bool,
+        /// Suppress per-file output (show only progress bar and summary)
+        #[arg(long, short)]
+        quiet: bool,
     },
 }
 
@@ -127,6 +130,7 @@ fn process_file_for_copy(
     dry_run_prefix: &str,
     op_word: &str,
     file_op_lock: &std::sync::Arc<std::sync::Mutex<()>>,
+    quiet: bool,
 ) -> FileProcessingResult {
     // Extract source_group from filename
     let source_group = path
@@ -178,12 +182,14 @@ fn process_file_for_copy(
                 .unwrap_or_else(|| "unknown".to_string());
             match copy_to_dir(path, &dup_dir, &original_name) {
                 Ok(dest) => {
-                    eprintln!(
-                        "DUPLICATE {} -> {} (same as {})",
-                        path.display(),
-                        dest.display(),
-                        existing.display()
-                    );
+                    if !quiet {
+                        eprintln!(
+                            "DUPLICATE {} -> {} (same as {})",
+                            path.display(),
+                            dest.display(),
+                            existing.display()
+                        );
+                    }
                     let manifest_entry = create_manifest_entry(&dest, &hex_hash, path, &original_name, None, source_group.as_deref());
                     if move_files {
                         remove_source_safely(path, &dest);
@@ -204,12 +210,14 @@ fn process_file_for_copy(
                 }
             }
         } else {
-            eprintln!(
-                "{}DUPLICATE {} (same as {})",
-                dry_run_prefix,
-                path.display(),
-                existing.display()
-            );
+            if !quiet {
+                eprintln!(
+                    "{}DUPLICATE {} (same as {})",
+                    dry_run_prefix,
+                    path.display(),
+                    existing.display()
+                );
+            }
         }
         return FileProcessingResult::Duplicate {
             dest: None,
@@ -236,12 +244,14 @@ fn process_file_for_copy(
                 let _lock = file_op_lock.lock().unwrap();
                 match copy_file_to(path, &dest) {
                     Ok(()) => {
-                        eprintln!(
-                            "{} {} -> {}",
-                            op_word,
-                            path.display(),
-                            dest.display()
-                        );
+                        if !quiet {
+                            eprintln!(
+                                "{} {} -> {}",
+                                op_word,
+                                path.display(),
+                                dest.display()
+                            );
+                        }
                         let original_name = path
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -280,13 +290,15 @@ fn process_file_for_copy(
                     }
                 }
             } else {
-                eprintln!(
-                    "{}{} {} -> {}",
-                    dry_run_prefix,
-                    op_word,
-                    path.display(),
-                    dest.display()
-                );
+                if !quiet {
+                    eprintln!(
+                        "{}{} {} -> {}",
+                        dry_run_prefix,
+                        op_word,
+                        path.display(),
+                        dest.display()
+                    );
+                }
                 FileProcessingResult::Imported {
                     dest,
                     manifest_entry: None,
@@ -307,12 +319,14 @@ fn process_file_for_copy(
                 let _lock = file_op_lock.lock().unwrap();
                 match copy_file_to(path, &dest) {
                     Ok(()) => {
-                        eprintln!(
-                            "{} {} -> {}",
-                            op_word,
-                            path.display(),
-                            dest.display()
-                        );
+                        if !quiet {
+                            eprintln!(
+                                "{} {} -> {}",
+                                op_word,
+                                path.display(),
+                                dest.display()
+                            );
+                        }
                         let original_name = path
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -345,12 +359,14 @@ fn process_file_for_copy(
                     }
                 }
             } else {
-                eprintln!(
-                    "{}UNDATED {} -> {}",
-                    dry_run_prefix,
-                    path.display(),
-                    dest.display()
-                );
+                if !quiet {
+                    eprintln!(
+                        "{}UNDATED {} -> {}",
+                        dry_run_prefix,
+                        path.display(),
+                        dest.display()
+                    );
+                }
                 FileProcessingResult::Undated {
                     dest,
                     manifest_entry: None,
@@ -369,6 +385,7 @@ fn main() {
             target,
             execute,
             r#move: move_files,
+            quiet,
         } => {
             let files = scan::discover_files(&source);
             let dedup_index = manifest::build_dedup_index(&target);
@@ -426,6 +443,7 @@ fn main() {
                         dry_run_prefix,
                         op_word,
                         &file_op_lock,
+                        quiet,
                     );
 
                     // Update counters
