@@ -68,10 +68,9 @@ fn try_exif_dates(path: &Path) -> Option<DateExtracted> {
     ];
 
     for (tag, source) in &tag_chain {
-        if let Some(entry) = exif.get(*tag) {
-            if let Some(extracted) = entry_value_to_date(entry, *source) {
-                return Some(extracted);
-            }
+        if let Some(entry) = exif.get(*tag)
+            && let Some(extracted) = entry_value_to_date(entry, *source) {
+            return Some(extracted);
         }
     }
     None
@@ -88,10 +87,9 @@ fn try_quicktime_dates(path: &Path) -> Option<DateExtracted> {
 
     for (key, source) in qt_keys {
         for (k, v) in &entries {
-            if k == key {
-                if let Some(extracted) = entry_value_to_date(v, *source) {
-                    return Some(extracted);
-                }
+            if k == key
+                && let Some(extracted) = entry_value_to_date(v, *source) {
+                return Some(extracted);
             }
         }
     }
@@ -102,17 +100,15 @@ fn try_filesystem_dates(path: &Path) -> Option<DateExtracted> {
     let metadata = std::fs::metadata(path).ok()?;
 
     // Try creation time first (not available on all platforms/filesystems)
-    if let Ok(created) = metadata.created() {
-        if let Some(extracted) = system_time_to_date(created, DateSource::FilesystemCreated) {
-            return Some(extracted);
-        }
+    if let Ok(created) = metadata.created()
+        && let Some(extracted) = system_time_to_date(created, DateSource::FilesystemCreated) {
+        return Some(extracted);
     }
 
     // Fall back to modification time
-    if let Ok(modified) = metadata.modified() {
-        if let Some(extracted) = system_time_to_date(modified, DateSource::FilesystemModified) {
-            return Some(extracted);
-        }
+    if let Ok(modified) = metadata.modified()
+        && let Some(extracted) = system_time_to_date(modified, DateSource::FilesystemModified) {
+        return Some(extracted);
     }
 
     None
@@ -151,18 +147,17 @@ fn entry_value_to_date(entry: &nom_exif::EntryValue, source: DateSource) -> Opti
             });
         }
     }
-    if let Some(s) = entry.as_str() {
-        if let Some((year, month, day, hour, minute, second)) = parse_date_string(s) {
-            return Some(DateExtracted::Found {
-                year,
-                month,
-                day,
-                hour,
-                minute,
-                second,
-                source,
-            });
-        }
+    if let Some(s) = entry.as_str()
+        && let Some((year, month, day, hour, minute, second)) = parse_date_string(s) {
+        return Some(DateExtracted::Found {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            source,
+        });
     }
     None
 }
@@ -182,17 +177,16 @@ fn parse_date_string(s: &str) -> Option<(u16, u8, u8, u8, u8, u8)> {
     let trimmed = s.trim();
 
     for fmt in &formats {
-        if let Ok(parsed) = jiff::fmt::strtime::parse(fmt, trimmed) {
-            if let Ok(dt) = parsed.to_datetime() {
-                return Some((
-                    dt.year() as u16,
-                    dt.month() as u8,
-                    dt.day() as u8,
-                    dt.hour() as u8,
-                    dt.minute() as u8,
-                    dt.second() as u8,
-                ));
-            }
+        if let Ok(parsed) = jiff::fmt::strtime::parse(fmt, trimmed)
+            && let Ok(dt) = parsed.to_datetime() {
+            return Some((
+                dt.year() as u16,
+                dt.month() as u8,
+                dt.day() as u8,
+                dt.hour() as u8,
+                dt.minute() as u8,
+                dt.second() as u8,
+            ));
         }
     }
     None

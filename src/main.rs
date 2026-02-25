@@ -4,7 +4,7 @@ mod scan;
 
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use rayon::prelude::*;
@@ -67,20 +67,15 @@ struct ManifestEntry {
 #[derive(Debug)]
 enum FileProcessingResult {
     Imported {
-        dest: PathBuf,
         manifest_entry: Option<ManifestEntry>,
     },
     Duplicate {
-        dest: Option<PathBuf>,
         manifest_entry: Option<ManifestEntry>,
     },
     Undated {
-        dest: PathBuf,
         manifest_entry: Option<ManifestEntry>,
     },
-    Corrupt {
-        quarantine_dest: Option<PathBuf>,
-    },
+    Corrupt,
 }
 
 fn now_iso8601() -> String {
@@ -88,9 +83,9 @@ fn now_iso8601() -> String {
 }
 
 fn create_manifest_entry(
-    dest: &PathBuf,
+    dest: &Path,
     hex_hash: &str,
-    source_path: &PathBuf,
+    source_path: &Path,
     original_name: &str,
     date_source: Option<&str>,
     source_group: Option<&str>,
@@ -120,18 +115,19 @@ fn create_manifest_entry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_file_for_copy(
-    path: &PathBuf,
+    path: &Path,
     extension: &str,
     dedup_index: &std::collections::HashMap<String, PathBuf>,
-    target: &PathBuf,
+    target: &Path,
     execute: bool,
     move_files: bool,
-    dry_run_prefix: &str,
-    op_word: &str,
     file_op_lock: &std::sync::Arc<std::sync::Mutex<()>>,
     quiet: bool,
 ) -> FileProcessingResult {
+    let dry_run_prefix = if execute { "" } else { "[DRY RUN] " };
+    let op_word = if move_files { "MOVE" } else { "COPY" };
     // Extract source_group from filename
     let source_group = path
         .file_name()
@@ -164,9 +160,7 @@ fn process_file_for_copy(
                     }
                 }
             }
-            return FileProcessingResult::Corrupt {
-                quarantine_dest: None,
-            };
+            return FileProcessingResult::Corrupt;
         }
     };
 
@@ -195,7 +189,6 @@ fn process_file_for_copy(
                         remove_source_safely(path, &dest);
                     }
                     return FileProcessingResult::Duplicate {
-                        dest: Some(dest),
                         manifest_entry: Some(manifest_entry),
                     };
                 }
@@ -209,18 +202,15 @@ fn process_file_for_copy(
                     }
                 }
             }
-        } else {
-            if !quiet {
-                eprintln!(
-                    "{}DUPLICATE {} (same as {})",
-                    dry_run_prefix,
-                    path.display(),
-                    existing.display()
-                );
-            }
+        } else if !quiet {
+            eprintln!(
+                "{}DUPLICATE {} (same as {})",
+                dry_run_prefix,
+                path.display(),
+                existing.display()
+            );
         }
         return FileProcessingResult::Duplicate {
-            dest: None,
             manifest_entry: None,
         };
     }
@@ -233,7 +223,7 @@ fn process_file_for_copy(
             let dest_dir = target.join(format!("{:04}", year)).join(format!("{:02}", month));
 
             // Lock to prevent race condition in filename generation + copy
-            let (filename, dest) = {
+            let (_filename, dest) = {
                 let _lock = file_op_lock.lock().unwrap();
                 let filename = manifest::generate_filename(&date, extension, &hash, &dest_dir);
                 let dest = dest_dir.join(&filename);
@@ -268,7 +258,6 @@ fn process_file_for_copy(
                             remove_source_safely(path, &dest);
                         }
                         FileProcessingResult::Imported {
-                            dest,
                             manifest_entry: Some(manifest_entry),
                         }
                     }
@@ -284,9 +273,7 @@ fn process_file_for_copy(
                                 e
                             );
                         }
-                        FileProcessingResult::Corrupt {
-                            quarantine_dest: None,
-                        }
+                        FileProcessingResult::Corrupt
                     }
                 }
             } else {
@@ -300,7 +287,6 @@ fn process_file_for_copy(
                     );
                 }
                 FileProcessingResult::Imported {
-                    dest,
                     manifest_entry: None,
                 }
             }
@@ -337,7 +323,6 @@ fn process_file_for_copy(
                             remove_source_safely(path, &dest);
                         }
                         FileProcessingResult::Undated {
-                            dest,
                             manifest_entry: Some(manifest_entry),
                         }
                     }
@@ -353,9 +338,7 @@ fn process_file_for_copy(
                                 e
                             );
                         }
-                        FileProcessingResult::Corrupt {
-                            quarantine_dest: None,
-                        }
+                        FileProcessingResult::Corrupt
                     }
                 }
             } else {
@@ -368,7 +351,6 @@ fn process_file_for_copy(
                     );
                 }
                 FileProcessingResult::Undated {
-                    dest,
                     manifest_entry: None,
                 }
             }
@@ -416,9 +398,6 @@ fn main() {
                         .unwrap_or_else(|_| ProgressStyle::default_bar()), // safe: static template string
                 );
 
-            let dry_run_prefix = if execute { "" } else { "[DRY RUN] " };
-            let op_word = if move_files { "MOVE" } else { "COPY" };
-
             // Atomic counters for results
             let imported_count = Arc::new(AtomicUsize::new(0));
             let duplicate_count = Arc::new(AtomicUsize::new(0));
@@ -440,8 +419,6 @@ fn main() {
                         &target,
                         execute,
                         move_files,
-                        dry_run_prefix,
-                        op_word,
                         &file_op_lock,
                         quiet,
                     );
@@ -457,7 +434,7 @@ fn main() {
                         FileProcessingResult::Undated { .. } => {
                             undated_count.fetch_add(1, Ordering::Relaxed);
                         }
-                        FileProcessingResult::Corrupt { .. } => {
+                        FileProcessingResult::Corrupt => {
                             corrupt_count.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -478,17 +455,17 @@ fn main() {
 
                 for result in &results {
                     match result {
-                        FileProcessingResult::Imported { manifest_entry, .. }
-                        | FileProcessingResult::Duplicate { manifest_entry, .. }
-                        | FileProcessingResult::Undated { manifest_entry, .. } => {
+                        FileProcessingResult::Imported { manifest_entry }
+                        | FileProcessingResult::Duplicate { manifest_entry }
+                        | FileProcessingResult::Undated { manifest_entry } => {
                             if let Some(entry) = manifest_entry {
                                 manifest_batches
                                     .entry(entry.dir.clone())
-                                    .or_insert_with(Vec::new)
+                                    .or_default()
                                     .push((entry.filename.clone(), entry.entry.clone()));
                             }
                         }
-                        FileProcessingResult::Corrupt { .. } => {}
+                        FileProcessingResult::Corrupt => {}
                     }
                 }
 

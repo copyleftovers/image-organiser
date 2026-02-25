@@ -21,12 +21,9 @@ pub fn classify_file(path: &Path) -> MediaFile {
         .map(|ext| ext.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    let recognized = match extension.as_str() {
-        "heic" | "heif" | "jpeg" | "jpg" | "png" | "tiff" | "tif" | "webp" | "bmp" | "gif"
+    let recognized = matches!(extension.as_str(), "heic" | "heif" | "jpeg" | "jpg" | "png" | "tiff" | "tif" | "webp" | "bmp" | "gif"
         | "avif" | "cr2" | "cr3" | "nef" | "arw" | "raf" | "rw2" | "dng" | "orf" | "pef"
-        | "srw" | "3fr" | "mov" | "mp4" | "m4v" | "avi" | "mkv" | "3gp" | "aae" => true,
-        _ => false,
-    };
+        | "srw" | "3fr" | "mov" | "mp4" | "m4v" | "avi" | "mkv" | "3gp" | "aae");
 
     if recognized {
         MediaFile::Recognized {
